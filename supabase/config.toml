@@ -1,0 +1,8 @@
+[functions.mpesa-withdraw]
+verify_jwt = true
+
+[functions.paypal-checkout]
+verify_jwt = true
+
+[functions.mpesa-stk-push]
+verify_jwt = true

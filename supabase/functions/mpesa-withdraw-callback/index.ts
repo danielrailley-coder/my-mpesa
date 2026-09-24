@@ -7,15 +7,6 @@ const corsHeaders = {
     "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-type WithdrawalRow = {
-  id: string;
-  user_id: string;
-  amount: number;
-  phone_number: string;
-  status: string;
-  mpesa_reference: string;
-};
-
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
@@ -26,7 +17,9 @@ Deno.serve(async (req: Request) => {
 
   if (req.method !== "POST") {
     return new Response(
-      JSON.stringify({ error: "Method not allowed" }),
+      JSON.stringify({
+        error: "Method not allowed",
+      }),
       {
         status: 405,
         headers: {
@@ -37,24 +30,36 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
-  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-
-  const supabase = createClient(supabaseUrl, serviceRoleKey, {
-    auth: { persistSession: false },
-  });
-
   try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const serviceRoleKey =
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
+    const supabase = createClient(
+      supabaseUrl,
+      serviceRoleKey,
+      {
+        auth: {
+          persistSession: false,
+        },
+      },
+    );
+
     const body = await req.json();
 
-    // Safaricom B2C callback structure:
-    // { Result: { ResultType, ResultCode, ResultDesc, OriginatorConversationID,
-    //             ConversationID, TransactionID, ResultParameters: { ... } } }
+    console.log(
+      "M-Pesa B2C callback:",
+      JSON.stringify(body),
+    );
+
     const result = body?.Result;
 
     if (!result) {
       return new Response(
-        JSON.stringify({ error: "Invalid callback payload" }),
+        JSON.stringify({
+          success: false,
+          error: "Missing Result object.",
+        }),
         {
           status: 400,
           headers: {
@@ -65,25 +70,80 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const resultCode = result.ResultCode;
-    const resultDesc = result.ResultDesc;
-    const conversationId =
-      result.OriginatorConversationID || result.ConversationID;
-    const transactionId = result.TransactionID;
+    const originatorConversationId =
+      result.OriginatorConversationID;
 
-    // Match the withdrawal by the conversation ID stored in mpesa_reference
-    const { data: withdrawal, error: fetchError } = await supabase
-      .from("withdrawals")
-      .select("id, user_id, amount, phone_number, status, mpesa_reference")
-      .eq("mpesa_reference", conversationId)
-      .maybeSingle();
+    const conversationId = result.ConversationID;
 
-    if (fetchError || !withdrawal) {
-      // Safaricom still expects a 200 even if we can't find the row
-      return new Response(
-        JSON.stringify({ received: true }),
+    const resultCode = Number(result.ResultCode);
+
+    const resultDescription =
+      result.ResultDesc || "Unknown M-Pesa result";
+
+    const resultParameters =
+      result.ResultParameters?.ResultParameter || [];
+
+    let transactionReceipt = "";
+
+    if (Array.isArray(resultParameters)) {
+      const receiptParameter = resultParameters.find(
+        (parameter: any) =>
+          parameter.Key === "TransactionReceipt",
+      );
+
+      if (receiptParameter) {
+        transactionReceipt = String(
+          receiptParameter.Value || "",
+        );
+      }
+    }
+
+    // Find the withdrawal using the conversation ID
+    let withdrawal = null;
+
+    if (originatorConversationId) {
+      const { data } = await supabase
+        .from("withdrawals")
+        .select("id, status, mpesa_reference")
+        .eq(
+          "mpesa_reference",
+          originatorConversationId,
+        )
+        .maybeSingle();
+
+      withdrawal = data;
+    }
+
+    // Fallback to ConversationID
+    if (!withdrawal && conversationId) {
+      const { data } = await supabase
+        .from("withdrawals")
+        .select("id, status, mpesa_reference")
+        .eq(
+          "mpesa_reference",
+          conversationId,
+        )
+        .maybeSingle();
+
+      withdrawal = data;
+    }
+
+    if (!withdrawal) {
+      console.error(
+        "Withdrawal not found for callback",
         {
-          status: 200,
+          originatorConversationId,
+          conversationId,
+        },
+      );
+
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Withdrawal not found.",
+        }),
+        {
+          status: 404,
           headers: {
             ...corsHeaders,
             "Content-Type": "application/json",
@@ -92,42 +152,56 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const w = withdrawal as WithdrawalRow;
-
-    // Prevent duplicate callbacks from reverting a finalized withdrawal
-    if (w.status !== "processing") {
-      return new Response(
-        JSON.stringify({ received: true, already_processed: true }),
-        {
-          status: 200,
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-          },
-        },
-      );
-    }
-
-    // ResultCode 0 means the B2C payment succeeded
+    // Successful transaction
     if (resultCode === 0) {
-      const updatePayload: Record<string, unknown> = {
-        status: "completed",
-        failure_reason: "",
-        processed_at: new Date().toISOString(),
-      };
+      const reference =
+        transactionReceipt ||
+        conversationId ||
+        originatorConversationId ||
+        `MPESA-${Date.now()}`;
 
-      // Prefer the actual M-Pesa transaction ID from the callback
-      if (transactionId) {
-        updatePayload.mpesa_reference = transactionId;
+      const { error } = await supabase
+        .from("withdrawals")
+        .update({
+          status: "completed",
+          mpesa_reference: reference,
+          processed_at: new Date().toISOString(),
+          failure_reason: "",
+        })
+        .eq("id", withdrawal.id);
+
+      if (error) {
+        console.error(
+          "Failed to update completed withdrawal:",
+          error,
+        );
+
+        return new Response(
+          JSON.stringify({
+            success: false,
+            error: "Database update failed.",
+          }),
+          {
+            status: 500,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json",
+            },
+          },
+        );
       }
 
-      await supabase
-        .from("withdrawals")
-        .update(updatePayload)
-        .eq("id", w.id);
+      console.log(
+        `Withdrawal ${withdrawal.id} completed successfully.`,
+      );
 
       return new Response(
-        JSON.stringify({ received: true, status: "completed" }),
+        JSON.stringify({
+          success: true,
+          status: "completed",
+          withdrawal_id: withdrawal.id,
+          mpesa_reference: reference,
+        }),
         {
           status: 200,
           headers: {
@@ -138,18 +212,49 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    // Any non-zero ResultCode is a failure (timeout, insufficient funds, etc.)
-    await supabase
+    // Failed transaction
+    const { error } = await supabase
       .from("withdrawals")
       .update({
         status: "failed",
-        failure_reason: resultDesc || `ResultCode ${resultCode}`,
+        failure_reason:
+          `M-Pesa ResultCode ${resultCode}: ${resultDescription}`,
         processed_at: new Date().toISOString(),
       })
-      .eq("id", w.id);
+      .eq("id", withdrawal.id);
+
+    if (error) {
+      console.error(
+        "Failed to update failed withdrawal:",
+        error,
+      );
+
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: "Database update failed.",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    console.log(
+      `Withdrawal ${withdrawal.id} failed: ${resultDescription}`,
+    );
 
     return new Response(
-      JSON.stringify({ received: true, status: "failed" }),
+      JSON.stringify({
+        success: true,
+        status: "failed",
+        withdrawal_id: withdrawal.id,
+        reason: resultDescription,
+      }),
       {
         status: 200,
         headers: {
@@ -159,7 +264,7 @@ Deno.serve(async (req: Request) => {
       },
     );
   } catch (error) {
-    console.error("Withdrawal callback error:", error);
+    console.error("Callback error:", error);
 
     return new Response(
       JSON.stringify({

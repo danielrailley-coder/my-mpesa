@@ -2,10 +2,16 @@ import { createClient } from "npm:@supabase/supabase-js@2";
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
   "Access-Control-Allow-Headers":
     "Content-Type, Authorization, X-Client-Info, Apikey",
 };
+
+const DARAJA_AUTH_URL =
+  "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials";
+
+const DARAJA_B2C_URL =
+  "https://sandbox.safaricom.co.ke/mpesa/b2c/v1/paymentrequest";
 
 type WithdrawalRow = {
   id: string;
@@ -15,32 +21,6 @@ type WithdrawalRow = {
   status: string;
 };
 
-/*
- * IMPORTANT:
- * This version is configured for DARaja SANDBOX.
- *
- * Flow:
- * Website -> this function -> Daraja B2C
- * Daraja -> this function (?callback=1)
- * Callback -> withdrawal becomes completed/failed
- */
-
-const DARAJA_AUTH_URL =
-  "https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials";
-
-const DARAJA_B2C_URL =
-  "https://sandbox.safaricom.co.ke/mpesa/b2c/v1/paymentrequest";
-
-function jsonResponse(data: unknown, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      ...corsHeaders,
-      "Content-Type": "application/json",
-    },
-  });
-}
-
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, {
@@ -49,357 +29,220 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  if (req.method !== "POST") {
+    return new Response(
+      JSON.stringify({ error: "Method not allowed" }),
+      {
+        status: 405,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+  }
+
   try {
-    const supabaseUrl = Deno.env.get("SUPABASE_URL");
-    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    // --------------------------------------------------
+    // 1. Check M-Pesa secrets
+    // --------------------------------------------------
 
     const consumerKey = Deno.env.get("MPESA_CONSUMER_KEY");
     const consumerSecret = Deno.env.get("MPESA_CONSUMER_SECRET");
     const shortcode = Deno.env.get("MPESA_SHORTCODE");
-
-    // B2C uses these two credentials.
     const initiatorName = Deno.env.get("MPESA_INITIATOR_NAME");
     const securityCredential = Deno.env.get("MPESA_SECURITY_CREDENTIAL");
+    const usdToKesRate = Deno.env.get("MPESA_USD_TO_KES_RATE");
 
     if (
-      !supabaseUrl ||
-      !serviceRoleKey ||
       !consumerKey ||
       !consumerSecret ||
       !shortcode ||
       !initiatorName ||
-      !securityCredential
+      !securityCredential ||
+      !usdToKesRate
     ) {
-      return jsonResponse(
+      return new Response(
+        JSON.stringify({
+          error: "Missing required M-Pesa configuration.",
+        }),
         {
-          error:
-            "Missing required M-Pesa or Supabase environment secrets.",
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
         },
-        500
       );
     }
 
-    const supabase = createClient(
-      supabaseUrl,
-      serviceRoleKey,
-      {
-        auth: {
-          persistSession: false,
+    const rate = Number(usdToKesRate);
+
+    if (!Number.isFinite(rate) || rate <= 0) {
+      return new Response(
+        JSON.stringify({
+          error: "Invalid MPESA_USD_TO_KES_RATE.",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
         },
-      }
-    );
-
-    /*
-     * ============================================================
-     * SAFARICOM CALLBACK
-     * ============================================================
-     *
-     * Safaricom calls this URL after processing the B2C request:
-     *
-     * /mpesa-withdraw?callback=1
-     */
-
-    const url = new URL(req.url);
-    const isCallback = url.searchParams.get("callback") === "1";
-
-    if (isCallback) {
-      if (req.method !== "POST") {
-        return jsonResponse(
-          { error: "Callback must use POST" },
-          405
-        );
-      }
-
-      const callbackBody = await req.json();
-
-      console.log(
-        "M-Pesa B2C callback:",
-        JSON.stringify(callbackBody)
-      );
-
-      const result =
-        callbackBody?.Result ||
-        callbackBody?.result ||
-        callbackBody;
-
-      const resultCode = Number(
-        result?.ResultCode ??
-          result?.resultCode ??
-          -1
-      );
-
-      const resultDescription =
-        result?.ResultDesc ??
-        result?.ResultDescription ??
-        result?.resultDesc ??
-        "Unknown M-Pesa result";
-
-      /*
-       * Try to identify our withdrawal.
-       *
-       * We put the withdrawal ID into Remarks when submitting
-       * the B2C request.
-       */
-      const remarks =
-        result?.ResultParameters?.ResultParameter?.find(
-          (p: any) =>
-            p?.Key === "TransactionReceipt" ||
-            p?.Key === "ConversationID" ||
-            p?.Key === "OriginatorConversationID"
-        );
-
-      /*
-       * We also search processing withdrawals using the
-       * conversation IDs supplied by Safaricom.
-       */
-      const conversationId =
-        result?.ConversationID ||
-        result?.conversationID ||
-        result?.OriginatorConversationID ||
-        result?.originatorConversationID;
-
-      let withdrawal = null;
-
-      if (conversationId) {
-        const { data } = await supabase
-          .from("withdrawals")
-          .select(
-            "id, user_id, amount, phone_number, status"
-          )
-          .eq("status", "processing")
-          .eq("mpesa_reference", conversationId)
-          .maybeSingle();
-
-        withdrawal = data;
-      }
-
-      /*
-       * If we cannot identify the withdrawal, acknowledge
-       * the callback without modifying an unknown record.
-       */
-      if (!withdrawal) {
-        console.warn(
-          "Could not match M-Pesa callback to a withdrawal.",
-          {
-            conversationId,
-            resultCode,
-            resultDescription,
-          }
-        );
-
-        return jsonResponse({
-          ResultCode: 0,
-          ResultDesc: "Callback received",
-        });
-      }
-
-      /*
-       * ResultCode 0 means successful B2C transaction.
-       */
-      if (resultCode === 0) {
-        const transactionReceipt =
-          result?.ResultParameters?.ResultParameter?.find(
-            (p: any) =>
-              p?.Key === "TransactionReceipt"
-          )?.Value;
-
-        await supabase
-          .from("withdrawals")
-          .update({
-            status: "completed",
-            mpesa_reference:
-              transactionReceipt ||
-              conversationId ||
-              withdrawal.id,
-            processed_at:
-              new Date().toISOString(),
-            failure_reason: "",
-          })
-          .eq("id", withdrawal.id)
-          .eq("status", "processing");
-
-        console.log(
-          `Withdrawal ${withdrawal.id} completed`
-        );
-      } else {
-        await supabase
-          .from("withdrawals")
-          .update({
-            status: "failed",
-            failure_reason:
-              `M-Pesa result ${resultCode}: ${resultDescription}`,
-            processed_at:
-              new Date().toISOString(),
-          })
-          .eq("id", withdrawal.id)
-          .eq("status", "processing");
-
-        console.log(
-          `Withdrawal ${withdrawal.id} failed`
-        );
-      }
-
-      /*
-       * Safaricom expects a successful acknowledgement.
-       */
-      return jsonResponse({
-        ResultCode: 0,
-        ResultDesc: "Callback received successfully",
-      });
-    }
-
-    /*
-     * ============================================================
-     * WITHDRAWAL REQUEST
-     * ============================================================
-     */
-
-    if (req.method !== "POST") {
-      return jsonResponse(
-        { error: "Method not allowed" },
-        405
       );
     }
+
+    // --------------------------------------------------
+    // 2. Verify logged-in user
+    // --------------------------------------------------
+
+    const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+    const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
+
+    const authHeader = req.headers.get("Authorization");
+
+    if (!authHeader) {
+      return new Response(
+        JSON.stringify({
+          error: "Missing Authorization header.",
+        }),
+        {
+          status: 401,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    const userClient = createClient(supabaseUrl, anonKey, {
+      auth: {
+        persistSession: false,
+      },
+      global: {
+        headers: {
+          Authorization: authHeader,
+        },
+      },
+    });
+
+    const {
+      data: { user },
+      error: userError,
+    } = await userClient.auth.getUser();
+
+    if (userError || !user) {
+      return new Response(
+        JSON.stringify({
+          error: "Unauthorized.",
+        }),
+        {
+          status: 401,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    // Service-role client for server-side database operations
+    const supabase = createClient(supabaseUrl, serviceRoleKey, {
+      auth: {
+        persistSession: false,
+      },
+    });
+
+    // --------------------------------------------------
+    // 3. Get withdrawal ID
+    // --------------------------------------------------
 
     const body = await req.json();
-    const withdrawalId = body?.withdrawal_id;
+    const withdrawalId = body.withdrawal_id;
 
     if (!withdrawalId) {
-      return jsonResponse(
-        { error: "Missing withdrawal_id" },
-        400
+      return new Response(
+        JSON.stringify({
+          error: "Missing withdrawal_id.",
+        }),
+        {
+          status: 400,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
       );
     }
 
-    /*
-     * Get withdrawal.
-     */
-    const { data: withdrawal, error: fetchError } =
+    // --------------------------------------------------
+    // 4. Get withdrawal
+    // --------------------------------------------------
+
+    const { data: withdrawal, error: withdrawalError } =
       await supabase
         .from("withdrawals")
         .select(
-          "id, user_id, amount, phone_number, status"
+          "id, user_id, amount, phone_number, status",
         )
         .eq("id", withdrawalId)
         .single();
 
-    if (fetchError || !withdrawal) {
-      return jsonResponse(
-        { error: "Withdrawal not found" },
-        404
+    if (withdrawalError || !withdrawal) {
+      return new Response(
+        JSON.stringify({
+          error: "Withdrawal not found.",
+        }),
+        {
+          status: 404,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
       );
     }
 
     const w = withdrawal as WithdrawalRow;
 
-    /*
-     * Only pending withdrawals can be started.
-     */
+    // Make sure this withdrawal belongs to the logged-in user
+    if (w.user_id !== user.id) {
+      return new Response(
+        JSON.stringify({
+          error: "You are not authorized to process this withdrawal.",
+        }),
+        {
+          status: 403,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
     if (w.status !== "pending") {
-      return jsonResponse(
+      return new Response(
+        JSON.stringify({
+          error: `Withdrawal cannot be processed. Current status: ${w.status}`,
+        }),
         {
-          error:
-            `Withdrawal already processed. Current status: ${w.status}`,
+          status: 409,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
         },
-        409
       );
     }
 
-    /*
-     * Validate phone number.
-     */
-    if (!/^254\d{9}$/.test(w.phone_number)) {
-      await supabase
-        .from("withdrawals")
-        .update({
-          status: "failed",
-          failure_reason:
-            "Invalid Kenyan M-Pesa phone number.",
-          processed_at:
-            new Date().toISOString(),
-        })
-        .eq("id", w.id);
+    // --------------------------------------------------
+    // 5. Lock withdrawal by changing pending -> processing
+    // --------------------------------------------------
 
-      return jsonResponse(
-        {
-          error:
-            "Invalid M-Pesa phone number. Use format 2547XXXXXXXX.",
-        },
-        400
-      );
-    }
-
-    /*
-     * Check available balance.
-     *
-     * IMPORTANT:
-     * Your withdrawals.amount is currently documented as USD.
-     * Daraja B2C expects KES.
-     *
-     * Therefore we do NOT perform a USD -> KES conversion here
-     * until we establish the exchange-rate/business rule.
-     *
-     * For now, the database amount is treated as the amount
-     * being sent to the Sandbox.
-     */
-    const { data: balance, error: balanceError } =
-      await supabase.rpc(
-        "get_available_balance",
-        {
-          p_user_id: w.user_id,
-        }
-      );
-
-    if (balanceError) {
-      return jsonResponse(
-        {
-          error: "Failed to verify available balance.",
-        },
-        500
-      );
-    }
-
-    const availableBalance = Number(balance);
-    const withdrawalAmount = Number(w.amount);
-
-    if (
-      !Number.isFinite(availableBalance) ||
-      !Number.isFinite(withdrawalAmount) ||
-      withdrawalAmount <= 0
-    ) {
-      return jsonResponse(
-        {
-          error: "Invalid withdrawal amount or balance.",
-        },
-        400
-      );
-    }
-
-    if (availableBalance < withdrawalAmount) {
-      await supabase
-        .from("withdrawals")
-        .update({
-          status: "failed",
-          failure_reason:
-            "Insufficient available balance.",
-          processed_at:
-            new Date().toISOString(),
-        })
-        .eq("id", w.id)
-        .eq("status", "pending");
-
-      return jsonResponse(
-        {
-          error: "Insufficient available balance.",
-          available_balance: availableBalance,
-        },
-        400
-      );
-    }
-
-    /*
-     * Lock the withdrawal before sending money.
-     */
     const { data: locked, error: lockError } =
       await supabase
         .from("withdrawals")
@@ -409,239 +252,366 @@ Deno.serve(async (req: Request) => {
         .eq("id", w.id)
         .eq("status", "pending")
         .select("id")
-        .maybeSingle();
+        .single();
 
     if (lockError || !locked) {
-      return jsonResponse(
+      return new Response(
+        JSON.stringify({
+          error: "Withdrawal is already being processed.",
+        }),
         {
-          error:
-            "Withdrawal is already being processed.",
+          status: 409,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
         },
-        409
       );
     }
 
-    /*
-     * ============================================================
-     * DARaja AUTHORIZATION
-     * ============================================================
-     */
+    // --------------------------------------------------
+    // 6. Check available USD balance
+    // --------------------------------------------------
+
+    const { data: balance, error: balanceError } =
+      await supabase.rpc("get_available_balance", {
+        p_user_id: w.user_id,
+      });
+
+    if (balanceError) {
+      await supabase
+        .from("withdrawals")
+        .update({
+          status: "failed",
+          failure_reason: "Balance check failed.",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", w.id);
+
+      return new Response(
+        JSON.stringify({
+          error: "Failed to verify balance.",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    const availableBalance = Number(balance);
+
+    // The database function includes this withdrawal
+    // because it is now in processing status.
+    if (
+      !Number.isFinite(availableBalance) ||
+      availableBalance < 0
+    ) {
+      await supabase
+        .from("withdrawals")
+        .update({
+          status: "failed",
+          failure_reason: "Insufficient available balance.",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", w.id);
+
+      return new Response(
+        JSON.stringify({
+          error: "Insufficient available balance.",
+          available_balance: availableBalance,
+        }),
+        {
+          status: 400,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    // --------------------------------------------------
+    // 7. Validate Kenyan M-Pesa phone number
+    // --------------------------------------------------
+
+    if (!/^254\d{9}$/.test(w.phone_number)) {
+      await supabase
+        .from("withdrawals")
+        .update({
+          status: "failed",
+          failure_reason: "Invalid M-Pesa phone number format.",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", w.id);
+
+      return new Response(
+        JSON.stringify({
+          error:
+            "Invalid M-Pesa phone number. Use format 2547XXXXXXXX.",
+        }),
+        {
+          status: 400,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    // --------------------------------------------------
+    // 8. Convert USD -> KES
+    // --------------------------------------------------
+
+    const usdAmount = Number(w.amount);
+    const kesAmount = Math.round(usdAmount * rate);
+
+    if (!Number.isFinite(kesAmount) || kesAmount <= 0) {
+      await supabase
+        .from("withdrawals")
+        .update({
+          status: "failed",
+          failure_reason: "Invalid withdrawal amount.",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", w.id);
+
+      return new Response(
+        JSON.stringify({
+          error: "Invalid withdrawal amount.",
+        }),
+        {
+          status: 400,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    // --------------------------------------------------
+    // 9. Get Daraja access token
+    // --------------------------------------------------
 
     const basicAuth = btoa(
-      `${consumerKey}:${consumerSecret}`
+      `${consumerKey}:${consumerSecret}`,
     );
 
-    const oauthResponse = await fetch(
-      DARAJA_AUTH_URL,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Basic ${basicAuth}`,
-        },
-      }
-    );
+    const authResponse = await fetch(DARAJA_AUTH_URL, {
+      method: "GET",
+      headers: {
+        Authorization: `Basic ${basicAuth}`,
+      },
+    });
 
-    if (!oauthResponse.ok) {
-      const errorText =
-        await oauthResponse.text();
+    const authText = await authResponse.text();
 
+    let authData: any;
+
+    try {
+      authData = JSON.parse(authText);
+    } catch {
+      authData = {};
+    }
+
+    if (!authResponse.ok || !authData.access_token) {
       await supabase
         .from("withdrawals")
         .update({
           status: "failed",
           failure_reason:
-            `M-Pesa authentication failed (${oauthResponse.status}).`,
-          processed_at:
-            new Date().toISOString(),
+            `M-Pesa authentication failed (${authResponse.status}).`,
+          processed_at: new Date().toISOString(),
         })
-        .eq("id", w.id)
-        .eq("status", "processing");
+        .eq("id", w.id);
 
-      console.error(
-        "Daraja OAuth error:",
-        errorText
-      );
-
-      return jsonResponse(
+      return new Response(
+        JSON.stringify({
+          error: "Failed to authenticate with M-Pesa Sandbox.",
+        }),
         {
-          error:
-            "Failed to authenticate with M-Pesa Sandbox.",
+          status: 502,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
         },
-        502
       );
     }
 
-    const oauthData =
-      await oauthResponse.json();
+    const accessToken = authData.access_token;
 
-    const accessToken =
-      oauthData?.access_token;
-
-    if (!accessToken) {
-      await supabase
-        .from("withdrawals")
-        .update({
-          status: "failed",
-          failure_reason:
-            "M-Pesa did not return an access token.",
-          processed_at:
-            new Date().toISOString(),
-        })
-        .eq("id", w.id)
-        .eq("status", "processing");
-
-      return jsonResponse(
-        {
-          error:
-            "M-Pesa authorization failed.",
-        },
-        502
-      );
-    }
-
-    /*
-     * ============================================================
-     * DARaja B2C REQUEST
-     * ============================================================
-     */
+    // --------------------------------------------------
+    // 10. Send B2C request
+    // --------------------------------------------------
 
     const callbackUrl =
-      `${supabaseUrl}/functions/v1/mpesa-withdraw?callback=1`;
+      `${supabaseUrl}/functions/v1/mpesa-withdraw-callback`;
 
     const b2cPayload = {
       InitiatorName: initiatorName,
       SecurityCredential: securityCredential,
       CommandID: "BusinessPayment",
-
-      /*
-       * Daraja B2C Amount is KES.
-       */
-      Amount: Math.round(withdrawalAmount),
-
+      Amount: kesAmount,
       PartyA: shortcode,
       PartyB: w.phone_number,
-
       Remarks: `Withdrawal ${w.id}`,
       QueueTimeOutURL: callbackUrl,
       ResultURL: callbackUrl,
       Occasion: "Withdrawal",
     };
 
-    console.log(
-      "Sending B2C request for withdrawal:",
-      w.id
-    );
+    const b2cResponse = await fetch(DARAJA_B2C_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(b2cPayload),
+    });
 
-    const b2cResponse = await fetch(
-      DARAJA_B2C_URL,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(b2cPayload),
-      }
-    );
+    const b2cText = await b2cResponse.text();
 
-    const responseText =
-      await b2cResponse.text();
-
-    let b2cData: any = {};
+    let b2cData: any;
 
     try {
-      b2cData = JSON.parse(responseText);
+      b2cData = JSON.parse(b2cText);
     } catch {
-      b2cData = {
-        rawResponse: responseText,
-      };
+      b2cData = {};
     }
 
-    console.log(
-      "Daraja B2C response:",
-      JSON.stringify(b2cData)
-    );
-
-    /*
-     * Daraja accepted the request.
-     *
-     * IMPORTANT:
-     * This does NOT mean the user has received the money yet.
-     * We remain "processing" until the callback arrives.
-     */
-    if (
-      !b2cResponse.ok ||
-      String(b2cData?.ResponseCode) !== "0"
-    ) {
-      const failReason =
-        b2cData?.errorMessage ||
-        b2cData?.ResponseDescription ||
-        b2cData?.rawResponse ||
+    if (!b2cResponse.ok || b2cData.ResponseCode !== "0") {
+      const reason =
+        b2cData.errorMessage ||
+        b2cData.ResponseDescription ||
         `HTTP ${b2cResponse.status}`;
 
       await supabase
         .from("withdrawals")
         .update({
           status: "failed",
-          failure_reason:
-            `M-Pesa B2C request failed: ${failReason}`,
-          processed_at:
-            new Date().toISOString(),
+          failure_reason: `M-Pesa B2C failed: ${reason}`,
+          processed_at: new Date().toISOString(),
         })
-        .eq("id", w.id)
-        .eq("status", "processing");
+        .eq("id", w.id);
 
-      return jsonResponse(
+      return new Response(
+        JSON.stringify({
+          error: `M-Pesa transfer failed: ${reason}`,
+        }),
         {
-          error:
-            `M-Pesa B2C request failed: ${failReason}`,
+          status: 502,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
         },
-        502
       );
     }
 
-    /*
-     * Save the Daraja conversation ID while waiting
-     * for the callback.
-     */
-    const conversationId =
-      b2cData?.OriginatorConversationID ||
-      b2cData?.ConversationID ||
-      `PENDING-${w.id}`;
+    // --------------------------------------------------
+    // 11. Save the Safaricom conversation ID
+    // --------------------------------------------------
 
-    await supabase
+    const conversationId =
+      b2cData.OriginatorConversationID ||
+      b2cData.ConversationID;
+
+    if (!conversationId) {
+      await supabase
+        .from("withdrawals")
+        .update({
+          status: "failed",
+          failure_reason:
+            "M-Pesa accepted request but returned no conversation ID.",
+          processed_at: new Date().toISOString(),
+        })
+        .eq("id", w.id);
+
+      return new Response(
+        JSON.stringify({
+          error:
+            "M-Pesa accepted the request but no conversation ID was returned.",
+        }),
+        {
+          status: 502,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
+
+    // IMPORTANT:
+    // Do NOT mark the withdrawal completed here.
+    // Safaricom will call the callback after processing.
+    const { error: updateError } = await supabase
       .from("withdrawals")
       .update({
         status: "processing",
         mpesa_reference: conversationId,
       })
-      .eq("id", w.id)
-      .eq("status", "processing");
+      .eq("id", w.id);
 
-    return jsonResponse({
-      success: true,
-      withdrawal_id: w.id,
-      status: "processing",
-      amount: withdrawalAmount,
-      phone_number: w.phone_number,
-      mpesa_reference: conversationId,
-      message:
-        "M-Pesa withdrawal request accepted and is being processed.",
-    });
-  } catch (error) {
-    console.error(
-      "mpesa-withdraw error:",
-      error
-    );
+    if (updateError) {
+      return new Response(
+        JSON.stringify({
+          error:
+            "M-Pesa accepted the request, but the withdrawal record could not be updated.",
+        }),
+        {
+          status: 500,
+          headers: {
+            ...corsHeaders,
+            "Content-Type": "application/json",
+          },
+        },
+      );
+    }
 
-    return jsonResponse(
+    return new Response(
+      JSON.stringify({
+        success: true,
+        withdrawal_id: w.id,
+        status: "processing",
+        usd_amount: usdAmount,
+        exchange_rate: rate,
+        kes_amount: kesAmount,
+        phone_number: w.phone_number,
+        message:
+          "M-Pesa withdrawal request accepted. Waiting for Safaricom callback.",
+      }),
       {
+        status: 200,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
+      },
+    );
+  } catch (error) {
+    console.error("Withdrawal error:", error);
+
+    return new Response(
+      JSON.stringify({
         error:
           error instanceof Error
             ? error.message
-            : "Internal server error",
+            : "Internal server error.",
+      }),
+      {
+        status: 500,
+        headers: {
+          ...corsHeaders,
+          "Content-Type": "application/json",
+        },
       },
-      500
     );
   }
 });
